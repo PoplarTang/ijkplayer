@@ -26,6 +26,8 @@
 #include <math.h>
 #include "ff_cmdutils.h"
 #include "ff_fferror.h"
+#include "ff_ffpipeline.h"
+#include "ff_ffpipenode.h"
 
 // FIXME: 9 work around NDKr8e or gcc4.7 bug
 // isnan() may not recognize some double NAN, so we test both double and float
@@ -1487,7 +1489,7 @@ static int audio_thread(void *arg)
     return ret;
 }
 
-static int video_thread(void *arg)
+static int ffplay_video_thread(void *arg)
 {
     FFPlayer *ffp = arg;
     VideoState *is = ffp->is;
@@ -1583,6 +1585,14 @@ static int video_thread(void *arg)
 #endif
     av_frame_free(&frame);
     return 0;
+}
+
+static int video_thread(void *arg)
+{
+    FFPlayer *ffp = (FFPlayer *)arg;
+
+    IJKFF_Pipenode *node = ffpipeline_open_video_decoder(ffp->pipeline, ffp);
+    return ffpipenode_run_sync(node);
 }
 
 // FFP_MERGE: subtitle_thread
@@ -1949,8 +1959,10 @@ static int stream_component_open(FFPlayer *ffp, int stream_index)
         av_dict_set_int(&opts, "lowres", stream_lowres, 0);
     if (avctx->codec_type == AVMEDIA_TYPE_VIDEO || avctx->codec_type == AVMEDIA_TYPE_AUDIO)
         av_dict_set(&opts, "refcounted_frames", "1", 0);
+    if (avctx->codec_type != AVMEDIA_TYPE_VIDEO) {
     if ((ret = avcodec_open2(avctx, codec, &opts)) < 0) {
         goto fail;
+    }
     }
     if ((t = av_dict_get(opts, "", NULL, AV_DICT_IGNORE_SUFFIX))) {
         av_log(NULL, AV_LOG_ERROR, "Option %s not found.\n", t->key);
@@ -2673,7 +2685,7 @@ fail:
 // FFP_MERGE: options
 // FFP_MERGE: show_usage
 // FFP_MERGE: show_help_default
-static int video_refresh_thread(void *arg)
+static int ffplay_video_refresh_thread(void *arg)
 {
     FFPlayer *ffp = arg;
     VideoState *is = ffp->is;
@@ -2687,6 +2699,13 @@ static int video_refresh_thread(void *arg)
     }
 
     return 0;
+}
+static int video_refresh_thread(void *arg)
+{
+    FFPlayer *ffp = (FFPlayer *)arg;
+
+    IJKFF_Pipenode *node = ffpipeline_open_video_output(ffp->pipeline, ffp);
+    return ffpipenode_run_sync(node);
 }
 
 static int lockmgr(void **mtx, enum AVLockOp op)
@@ -2852,6 +2871,7 @@ void ffp_destroy(FFPlayer *ffp)
 
     SDL_VoutFreeP(&ffp->vout);
     SDL_AoutFreeP(&ffp->aout);
+    ffpipeline_free_p(&ffp->pipeline);
     ffp_reset_internal(ffp);
 
     msg_queue_destroy(&ffp->msg_queue);
@@ -3086,6 +3106,19 @@ long ffp_get_playable_duration_l(FFPlayer *ffp)
     return (long)ffp->playable_duration_ms;
 }
 
+int ffp_packet_queue_get_or_buffering(FFPlayer *ffp, PacketQueue *q, AVPacket *pkt, int *serial, int *finished)
+{
+    return packet_queue_get_or_buffering(ffp, q, pkt, serial, finished);
+}
+
+bool ffp_is_flush_packet(FFPlayer *ffp, AVPacket *pkt)
+{
+    if (!pkt)
+        return false;
+
+    return pkt->data == flush_pkt.data;
+}
+
 void ffp_toggle_buffering_l(FFPlayer *ffp, int buffering_on)
 {
     VideoState *is = ffp->is;
@@ -3216,6 +3249,16 @@ void ffp_check_buffering_l(FFPlayer *ffp)
         ffp->current_high_water_mark_in_ms = hwm_in_ms;
         ffp_toggle_buffering(ffp, 0);
     }
+}
+
+int ffp_video_thread(FFPlayer *ffp)
+{
+    return ffplay_video_thread(ffp);
+}
+
+int ffp_video_refresh_thread(FFPlayer *ffp)
+{
+    return ffplay_video_refresh_thread(ffp);
 }
 
 static int ffp_format_control_message(struct AVFormatContext *s, int type,
